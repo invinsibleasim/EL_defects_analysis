@@ -1,333 +1,326 @@
+#import streamlit as st
+#from ultralytics import YOLO
+#import cv2
+#import numpy as np
+#from PIL import Image
 
-import os
+# Set Page Config
+#st.set_page_config(page_title="Custom YOLOv11 Detection", page_icon="🚀")
+#st.title("Object Detection with Custom YOLO Model")
+
+# Sidebar for Model Selection
+#model_path = 'temp/best.pt' # Path in your GitHub repo
+#confidence = st.sidebar.slider("Confidence", 0.0, 1.0, 0.5)
+
+# Load Model
+#@st.cache_resource
+#def load_model(path):
+    #return YOLO(path)
+
+#model = load_model(model_path)
+
+# File Uploader
+#uploaded_file = st.file_uploader("Upload Image", type=["jpg", "jpeg", "png"])
+
+#if uploaded_file is not None:
+    # Convert file to opencv image
+    #image = Image.open(uploaded_file)
+    #image = np.array(image)
+    
+    # Inference
+    #results = model.predict(image, conf=confidence)
+    #res_plotted = results[0].plot()
+    
+    # Display Result
+    #st.image(res_plotted, caption="Detected Image", use_column_width=True)
+
+
+# app_yolo11_streamlit.py
+# Streamlit web app: YOLO11 object detection on images and videos with confidence, class labels,
+# downloadable annotated outputs.
+# Author: Asim & M365 Copilot
+
 import io
-import time
-import json
-import zipfile
-import numpy as np
-import streamlit as st
-from PIL import Image
+import os
 from pathlib import Path
-from typing import List, Tuple, Dict, Any
+from typing import List, Dict
 
-# scikit-image (no OpenCV)
-from skimage import color, exposure, filters, morphology, util
-from skimage.filters import threshold_otsu
-from skimage.morphology import rectangle
+import streamlit as st
+import numpy as np
+import pandas as pd
+from PIL import Image
+import cv2
 
-# ---------------------------
-# Utilities
-# ---------------------------
-def ensure_dir(path: Path):
-    path.mkdir(parents=True, exist_ok=True)
+# Ultralytics YOLO11
+from ultralytics import YOLO
 
-def pil_to_np(img: Image.Image) -> np.ndarray:
-    """PIL RGB -> NumPy RGB uint8"""
-    return np.array(img.convert("RGB"))
+# ------------------------------
+# Utility functions
+# ------------------------------
 
-def np_to_pil(arr: np.ndarray) -> Image.Image:
-    """NumPy RGB uint8 -> PIL Image"""
-    return Image.fromarray(arr)
+# ---- Replace the sidebar selection with a fixed path to best.pt ----
+from pathlib import Path
 
-def save_image(path: Path, image_arr: np.ndarray, quality: int = 95):
-    ensure_dir(path.parent)
-    Image.fromarray(image_arr).save(path, format="JPEG", quality=quality)
+# Point this to your file; absolute paths are fine too
+weights_path = "temp/best.pt"
 
-def zip_directory(src_dir: Path, zip_path: Path):
-    ensure_dir(zip_path.parent)
-    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-        for root, _, files in os.walk(src_dir):
-            for f in files:
-                fp = Path(root) / f
-                zf.write(fp, fp.relative_to(src_dir))
+#with st.spinner("Loading YOLO11 model…"):
+    #model = load_model(weights_path)
 
-# ---------------------------
-# EL preprocessing (CLAHE + optional blur)
-# ---------------------------
-def normalize_el(img_rgb: np.ndarray, clip_limit: float = 0.02, tile_size: int = 8, sigma: float = 0.6) -> np.ndarray:
-    """
-    EL images: cells bright, gridlines darker.
-    Use CLAHE (adapthist) + mild Gaussian to enhance lines; return uint8 grayscale.
-    """
-    gray = color.rgb2gray(img_rgb)  # float [0,1]
-    clahe = exposure.equalize_adapthist(gray, clip_limit=clip_limit, kernel_size=tile_size)
-    if sigma and sigma > 0:
-        clahe = filters.gaussian(clahe, sigma=sigma)
-    gray_u8 = util.img_as_ubyte(clahe)
-    return gray_u8
 
-def binarize_image(gray_u8: np.ndarray, mode: str = "otsu") -> np.ndarray:
-    """Return binary image as uint8 {0,255} using Otsu or adaptive local threshold."""
-    if mode == "adaptive":
-        thr = filters.threshold_local(gray_u8, block_size=31, offset=5)
-        bw = (gray_u8 > thr).astype(np.uint8) * 255
-    else:
-        t = threshold_otsu(gray_u8)
-        bw = (gray_u8 > t).astype(np.uint8) * 255
-    return bw
+@st.cache_resource(show_spinner=False)
+def load_model(weights_path: str):
+    """Load YOLO model and cache it for reuse."""
+    model = YOLO(weights_path)
+    return model
 
-# ---------------------------
-# Grid line detection + cell building
-# ---------------------------
-def detect_line_maps(gray_u8: np.ndarray,
-                     polarity: str = "auto",
-                     binarize: str = "otsu",
-                     ksize_v: int = 25,
-                     ksize_h: int = 25) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Create vertical/horizontal line maps via erosion+dilation with rectangle footprints.
-    In EL: lines often darker → invert after binarization.
-    """
-    bw = binarize_image(gray_u8, mode=binarize)  # uint8 {0,255}
-    mean_val = gray_u8.mean()
-    if polarity == "auto":
-        use = 255 - bw if mean_val > 127 else bw
-    elif polarity == "dark":
-        use = 255 - bw
-    else:
-        use = bw
 
-    use_bool = use > 0  # boolean for skimage morphology
+def draw_boxes(frame: np.ndarray, boxes, names: Dict[int, str], conf_thresh: float = 0.25) -> np.ndarray:
+    """Draw bounding boxes and labels on a frame using YOLO results."""
+    img = frame.copy()
+    if boxes is None:
+        return img
 
-    # Vertical line enhancement (height ksize_v, width 1)
-    vert = morphology.dilation(morphology.erosion(use_bool, rectangle(ksize_v, 1)), rectangle(ksize_v, 1))
-    # Horizontal line enhancement (height 1, width ksize_h)
-    horiz = morphology.dilation(morphology.erosion(use_bool, rectangle(1, ksize_h)), rectangle(1, ksize_h))
+    # Generate a color palette for classes
+    def get_color(idx: int):
+        np.random.seed(idx)
+        color = tuple(int(x) for x in np.random.randint(0, 255, size=3))
+        return color
 
-    vert_u8 = (vert.astype(np.uint8)) * 255
-    horiz_u8 = (horiz.astype(np.uint8)) * 255
-    return vert_u8, horiz_u8
+    for i in range(len(boxes)):
+        b = boxes[i]
+        conf = float(b.conf[0]) if hasattr(b, 'conf') else float(b.conf)
+        cls_idx = int(b.cls[0]) if hasattr(b, 'cls') else int(b.cls)
+        if conf < conf_thresh:
+            continue
+        x1, y1, x2, y2 = map(int, b.xyxy[0]) if hasattr(b, 'xyxy') else map(int, b.xyxy)
+        color = get_color(cls_idx)
+        label = f"{names.get(cls_idx, str(cls_idx))} {conf:.2f}"
+        cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
+        # Label background
+        (tw, th), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+        cv2.rectangle(img, (x1, y1 - th - baseline), (x1 + tw, y1), color, -1)
+        cv2.putText(img, label, (x1, y1 - baseline), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+    return img
 
-def project_peaks(line_map_u8: np.ndarray, axis: int = 0, min_dist: int = 30, min_strength: float = 0.3) -> List[int]:
-    """
-    Sum along axis and find peaks (local maxima with min distance).
-    axis=0 → columns (vertical lines); axis=1 → rows (horizontal lines).
-    """
-    proj = line_map_u8.sum(axis=axis).astype(np.float64)
-    rng = proj.max() - proj.min()
-    proj_norm = (proj - proj.min()) / (rng + 1e-6)
-    peaks = []
-    last_idx = -min_dist
-    for i in range(1, len(proj_norm) - 1):
-        if proj_norm[i] > min_strength and proj_norm[i] > proj_norm[i - 1] and proj_norm[i] > proj_norm[i + 1]:
-            if i - last_idx >= min_dist:
-                peaks.append(i)
-                last_idx = i
-    return peaks
 
-def cuts_from_peaks(peaks: List[int], maxlen: int) -> List[int]:
-    """Convert peak positions (grid lines) to cut boundaries between cells."""
-    if len(peaks) < 2:
-        return [0, maxlen - 1]
-    cuts = [0]
-    for i in range(len(peaks) - 1):
-        cuts.append((peaks[i] + peaks[i + 1]) // 2)
-    cuts.append(maxlen - 1)
-    return sorted(list(set(cuts)))
+def results_to_df(res, names: Dict[int, str]) -> pd.DataFrame:
+    """Convert YOLO prediction results to a tidy DataFrame."""
+    rows = []
+    boxes = res.boxes
+    if boxes is None:
+        return pd.DataFrame(columns=["class_id", "class_name", "confidence", "x1", "y1", "x2", "y2"])
+    for i in range(len(boxes)):
+        b = boxes[i]
+        cls_idx = int(b.cls[0]) if hasattr(b, 'cls') else int(b.cls)
+        conf = float(b.conf[0]) if hasattr(b, 'conf') else float(b.conf)
+        x1, y1, x2, y2 = map(float, b.xyxy[0]) if hasattr(b, 'xyxy') else map(float, b.xyxy)
+        rows.append({
+            "class_id": cls_idx,
+            "class_name": names.get(cls_idx, str(cls_idx)),
+            "confidence": conf,
+            "x1": x1,
+            "y1": y1,
+            "x2": x2,
+            "y2": y2,
+        })
+    df = pd.DataFrame(rows)
+    return df
 
-def build_cells(img_rgb: np.ndarray,
-                vert_map_u8: np.ndarray,
-                horiz_map_u8: np.ndarray,
-                min_cell_w: int = 40,
-                min_cell_h: int = 40) -> List[Dict[str, Any]]:
-    """Construct cell crops from vertical/horizontal splits."""
-    H, W = vert_map_u8.shape
-    xs = project_peaks(vert_map_u8, axis=0, min_dist=max(20, W // 30))
-    ys = project_peaks(horiz_map_u8, axis=1, min_dist=max(20, H // 30))
 
-    xcuts = cuts_from_peaks(xs, W)
-    ycuts = cuts_from_peaks(ys, H)
-
-    cells = []
-    for r in range(len(ycuts) - 1):
-        y0, y1 = ycuts[r], ycuts[r + 1]
-        for c in range(len(xcuts) - 1):
-            x0, x1 = xcuts[c], xcuts[c + 1]
-            w, h = x1 - x0, y1 - y0
-            if w >= min_cell_w and h >= min_cell_h:
-                crop = img_rgb[y0:y1, x0:x1, :].copy()
-                cells.append({"row": r, "col": c, "bbox": (x0, y0, x1, y1), "image": crop})
-    return cells
-
-def draw_grid_overlay(img_rgb: np.ndarray, cells: List[Dict[str, Any]], color=(0, 255, 0), thickness: int = 2) -> np.ndarray:
-    """Overlay rectangles using pure NumPy (no cv2)."""
-    vis = img_rgb.copy()
-    for cell in cells:
-        x0, y0, x1, y1 = cell["bbox"]
-        # Top/bottom
-        vis[y0:y0+thickness, x0:x1, :] = color
-        vis[y1-thickness:y1, x0:x1, :] = color
-        # Left/right
-        vis[y0:y1, x0:x0+thickness, :] = color
-        vis[y0:y1, x1-thickness:x1, :] = color
-    return vis
-
-def manual_split(img_rgb: np.ndarray, n_rows: int, n_cols: int, margin: int = 0) -> List[Dict[str, Any]]:
-    """Fallback: evenly split image into n_rows × n_cols cells."""
-    H, W = img_rgb.shape[:2]
-    x0, y0 = margin, margin
-    x1, y1 = W - margin, H - margin
-    cell_w = (x1 - x0) // n_cols
-    cell_h = (y1 - y0) // n_rows
-    cells = []
-    for r in range(n_rows):
-        for c in range(n_cols):
-            cx0 = x0 + c * cell_w
-            cy0 = y0 + r * cell_h
-            cx1 = cx0 + cell_w
-            cy1 = cy0 + cell_h
-            crop = img_rgb[cy0:cy1, cx0:cx1, :].copy()
-            cells.append({"row": r, "col": c, "bbox": (cx0, cy0, cx1, cy1), "image": crop})
-    return cells
-
-# ---------------------------
+# ------------------------------
 # Streamlit UI
-# ---------------------------
-st.set_page_config(page_title="PV EL Module → Cell Segregation (no OpenCV)", layout="wide")
-st.title("🔬 PV EL Module → Cell Segregation (Streamlit, scikit‑image)")
+# ------------------------------
 
-st.markdown("""
-Upload **EL PV module** images to automatically detect the **cell grid** and export **per‑cell crops**.
-If auto detection struggles (partial modules/atypical layouts), use the **Manual rows × cols** fallback.
-""")
+st.set_page_config(page_title="YOLO11 Object Detection", page_icon="🟡", layout="wide")
+st.title("🟡 YOLO11 Object Detection (Images & Videos)")
 
-# Sidebar controls
-st.sidebar.header("⚙️ Settings")
-
-# Preprocessing
-clip_limit = st.sidebar.slider("CLAHE clip_limit (adapthist)", 0.005, 0.05, 0.02, 0.005)
-tile_size  = st.sidebar.slider("CLAHE tile size", 4, 32, 8, 2)
-gauss_sigma = st.sidebar.slider("Gaussian sigma", 0.0, 2.0, 0.6, 0.1)
-
-# Detection params
-polarity   = st.sidebar.selectbox("Line polarity", ["auto", "dark", "bright"], index=0)
-binarize   = st.sidebar.selectbox("Binarization", ["otsu", "adaptive"], index=0)
-ksize_v    = st.sidebar.slider("Vertical footprint height", 5, 75, 25, 1)
-ksize_h    = st.sidebar.slider("Horizontal footprint width", 5, 75, 25, 1)
-min_cell_w = st.sidebar.slider("Min cell width (px)", 20, 400, 40, 10)
-min_cell_h = st.sidebar.slider("Min cell height (px)", 20, 400, 40, 10)
-
-# Manual fallback
-use_manual    = st.sidebar.checkbox("Use manual rows × cols fallback", False)
-n_rows        = st.sidebar.number_input("Rows", min_value=1, max_value=20, value=6)
-n_cols        = st.sidebar.number_input("Cols", min_value=1, max_value=24, value=10)
-manual_margin = st.sidebar.number_input("Manual margin (px)", min_value=0, max_value=200, value=0)
-
-# Output options
-out_dir_str = st.sidebar.text_input("Output directory", "output")
-start_btn   = st.sidebar.button("🚀 Run")
-
-# Uploader
-uploads = st.file_uploader("Upload EL module image(s)", type=["jpg","jpeg","png","bmp","tif","tiff"], accept_multiple_files=True)
-
-# ---------------------------
-# Processing
-# ---------------------------
-def process_single_image(img_pil: Image.Image,
-                         settings: Dict[str, Any],
-                         save_root: Path) -> Dict[str, Any]:
-    t0 = time.time()
-    img_rgb = pil_to_np(img_pil)  # HWC RGB uint8
-
-    # Preprocess EL
-    gray_u8 = normalize_el(img_rgb,
-                           clip_limit=settings["clip_limit"],
-                           tile_size=settings["tile_size"],
-                           sigma=settings["gauss_sigma"])
-
-    # Auto detection or manual split
-    if not settings["use_manual"]:
-        vert_map_u8, horiz_map_u8 = detect_line_maps(gray_u8,
-                                                     polarity=settings["polarity"],
-                                                     binarize=settings["binarize"],
-                                                     ksize_v=settings["ksize_v"],
-                                                     ksize_h=settings["ksize_h"])
-        cells = build_cells(img_rgb,
-                            vert_map_u8,
-                            horiz_map_u8,
-                            min_cell_w=settings["min_cell_w"],
-                            min_cell_h=settings["min_cell_h"])
+st.sidebar.header("⚙️ Configuration")
+# Model selection
+model_choice = st.sidebar.selectbox(
+    "Choose YOLO11 model weights",
+    (
+        "yolo11n.pt",
+        "yolo11s.pt",
+        "yolo11m.pt",
+        "yolo11l.pt",
+        "yolo11x.pt",
+        "Upload custom .pt"
+    ),
+    index=0,
+)
+custom_model = None
+if model_choice == "Upload custom .pt":
+    custom_model = st.sidebar.file_uploader("Upload custom YOLO .pt weights", type=["pt"], accept_multiple_files=False)
+    if custom_model is not None:
+        # Save to a temporary path
+        temp_weights_path = Path(st.session_state.get("_temp_weights", "temp_model.pt"))
+        temp_weights_path.write_bytes(custom_model.read())
+        weights_path = str(temp_weights_path)
     else:
-        cells = manual_split(img_rgb,
-                             n_rows=settings["n_rows"],
-                             n_cols=settings["n_cols"],
-                             margin=settings["manual_margin"])
+        st.info("Upload a .pt file to proceed.")
+        st.stop()
+else:
+    weights_path = model_choice
 
-    overlay = draw_grid_overlay(img_rgb, cells)
+# Confidence & IoU thresholds
+conf_thresh = st.sidebar.slider("Confidence threshold", 0.0, 1.0, 0.25, 0.01)
+ious_thresh = st.sidebar.slider("IoU threshold (NMS)", 0.1, 1.0, 0.45, 0.01)
 
-    # Save outputs
-    ensure_dir(save_root)
-    save_image(save_root / "module_grid.jpg", overlay)
-    cells_dir = save_root / "cells"
-    ensure_dir(cells_dir)
+# Load model
+with st.spinner("Loading YOLO11 model…"):
+    model = load_model(weights_path)
 
-    meta = []
-    for cell in cells:
-        r, c = cell["row"], cell["col"]
-        save_image(cells_dir / f"cell_{r:02d}_{c:02d}.jpg", cell["image"])
-        meta.append({"row": r, "col": c, "bbox": cell["bbox"]})
+names = model.names if hasattr(model, 'names') else {i: str(i) for i in range(100)}
 
-    with open(save_root / "summary.json", "w") as f:
-        json.dump({"n_cells": len(cells), "cells": meta}, f, indent=2)
+# Class filter
+all_classes = list(names.values())
+selected_classes = st.sidebar.multiselect("Filter classes (optional)", options=all_classes, default=[])
+selected_class_ids = [k for k, v in names.items() if v in selected_classes] if selected_classes else None
 
-    return {
-        "n_cells": len(cells),
-        "grid_overlay": overlay,
-        "cells": cells,
-        "elapsed": time.time() - t0
-    }
+# Processing options
+max_det = st.sidebar.number_input("Max detections per image/frame", min_value=10, max_value=1000, value=300, step=10)
+imgsz = st.sidebar.number_input("Image size (inference)", min_value=320, max_value=1280, value=640, step=64)
 
-# Run pipeline
-if start_btn:
-    out_base = Path(out_dir_str)
-    ensure_dir(out_base)
+st.sidebar.markdown("---")
+st.sidebar.caption("Model and framework powered by Ultralytics YOLO11.")
 
-    if not uploads:
-        st.warning("Please upload at least one image.")
-    else:
-        for upl in uploads:
-            img_pil = Image.open(io.BytesIO(upl.read())).convert("RGB")
-            save_dir = out_base / Path(upl.name).stem
+# Tabs for image and video
+tab_img, tab_vid = st.tabs(["🖼️ Image", "🎥 Video"])
 
-            res = process_single_image(
-                img_pil,
-                settings={
-                    "clip_limit": clip_limit,
-                    "tile_size": tile_size,
-                    "gauss_sigma": gauss_sigma,
-                    "polarity": polarity,
-                    "binarize": binarize,
-                    "ksize_v": ksize_v,
-                    "ksize_h": ksize_h,
-                    "min_cell_w": min_cell_w,
-                    "min_cell_h": min_cell_h,
-                    "use_manual": use_manual,
-                    "n_rows": int(n_rows),
-                    "n_cols": int(n_cols),
-                    "manual_margin": int(manual_margin)
-                },
-                save_root=save_dir
+# ------------------------------
+# Image tab
+# ------------------------------
+with tab_img:
+    st.subheader("Image Inference")
+    img_file = st.file_uploader("Upload an image", type=["jpg", "jpeg", "png", "bmp", "webp"])
+    cam_img = st.camera_input("Or capture from webcam (optional)")
+
+    source_image = None
+    if img_file is not None:
+        source_image = Image.open(img_file).convert("RGB")
+    elif cam_img is not None:
+        source_image = Image.open(cam_img).convert("RGB")
+
+    if source_image is not None:
+        st.image(source_image, caption="Input image", use_column_width=True)
+        # Run inference
+        with st.spinner("Running detection…"):
+            res_list = model.predict(
+                source=np.array(source_image),
+                conf=conf_thresh,
+                iou=ious_thresh,
+                classes=selected_class_ids,
+                max_det=int(max_det),
+                imgsz=int(imgsz),
+                verbose=False,
             )
+            res = res_list[0]
+            df = results_to_df(res, names)
 
-            st.success(f"Processed {upl.name}: {res['n_cells']} cells in {res['elapsed']:.2f}s")
-            st.image(np_to_pil(res["grid_overlay"]), caption=f"Detected cell grid: {upl.name}", use_column_width=True)
+        # Annotate
+        annotated = draw_boxes(np.array(source_image), res.boxes, names, conf_thresh)
+        st.image(annotated, caption="Annotated image", use_column_width=True)
 
-            # Preview first 12 cells
-            cols_show = st.columns(min(6, max(1, int(n_cols))))
-            preview_count = min(len(res["cells"]), 12)
-            for i in range(preview_count):
-                r, c = res["cells"][i]["row"], res["cells"][i]["col"]
-                cols_show[i % len(cols_show)].image(
-                    np_to_pil(res["cells"][i]["image"]),
-                    caption=f"Cell r{r} c{c}",
-                    use_column_width=True
+        # Show table & stats
+        st.write("### Detections")
+        st.dataframe(df)
+        if not df.empty:
+            counts = df["class_name"].value_counts().rename_axis("class").reset_index(name="count")
+            st.write("### Class counts")
+            st.dataframe(counts)
+
+        # Download annotated image
+        annotated_pil = Image.fromarray(annotated)
+        buf = io.BytesIO()
+        annotated_pil.save(buf, format="PNG")
+        st.download_button(
+            label="⬇️ Download annotated image (PNG)",
+            data=buf.getvalue(),
+            file_name="annotated.png",
+            mime="image/png",
+        )
+
+# ------------------------------
+# Video tab
+# ------------------------------
+with tab_vid:
+    st.subheader("Video Inference")
+    video_file = st.file_uploader("Upload a video", type=["mp4", "avi", "mov", "mkv"])
+    frame_skip = st.number_input("Frame skip (process every Nth frame)", min_value=1, max_value=20, value=1)
+
+    if video_file is not None:
+        # Save uploaded video to a temp path
+        temp_video_path = Path("temp_input_video")
+        temp_video_path.write_bytes(video_file.read())
+
+        # Read video
+        cap = cv2.VideoCapture(str(temp_video_path))
+        if not cap.isOpened():
+            st.error("Failed to open video.")
+        else:
+            fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+            # Output video writer
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            out_path = Path("annotated_output.mp4")
+            writer = cv2.VideoWriter(str(out_path), fourcc, fps, (width, height))
+
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            progress = st.progress(0.0, text="Processing video…")
+
+            processed = 0
+            frame_idx = 0
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                frame_idx += 1
+                if frame_idx % int(frame_skip) != 0:
+                    continue
+                # Run inference per frame
+                res_list = model.predict(
+                    source=frame,
+                    conf=conf_thresh,
+                    iou=ious_thresh,
+                    classes=selected_class_ids,
+                    max_det=int(max_det),
+                    imgsz=int(imgsz),
+                    verbose=False,
+                )
+                res = res_list[0]
+                annotated_frame = draw_boxes(frame, res.boxes, names, conf_thresh)
+                writer.write(annotated_frame)
+                processed += 1
+                if total_frames:
+                    progress.progress(min((frame_idx / total_frames), 1.0), text=f"Processing frame {frame_idx}/{total_frames}")
+
+            cap.release()
+            writer.release()
+            st.success("Video processing complete.")
+            # Show preview of first frame from the output video
+            st.video(str(out_path))
+            # Provide download.
+            with open(out_path, "rb") as f:
+                st.download_button(
+                    label="⬇️ Download annotated video (MP4)",
+                    data=f.read(),
+                    file_name="annotated_output.mp4",
+                    mime="video/mp4",
                 )
 
-            # ZIP download for this image
-            zip_path = save_dir / f"{Path(upl.name).stem}_cells.zip"
-            zip_directory(save_dir, zip_path)
-            with open(zip_path, "rb") as f:
-                st.download_button(f"📦 Download crops for {upl.name}", data=f, file_name=zip_path.name)
-
-st.markdown("---")
-st.caption("Tips: Increase vertical/horizontal footprints when busbars are faint; switch to 'adaptive' threshold for uneven brightness; use manual rows×cols (e.g., 6×10) for standard layouts.")
+# ------------------------------
+# Footer
+# ------------------------------
+st.markdown(
+    """
+    ---
+    **Notes**:
+    - Confidence and class filters control which detections are rendered and listed.
+    - For large videos, increase *Frame skip* or reduce *Image size* for faster processing.
+    - If you upload custom weights, ensure they are compatible with Ultralytics YOLO11.
+    - This app uses the Ultralytics `YOLO` Python API. See documentation for details.
+    """
+)
